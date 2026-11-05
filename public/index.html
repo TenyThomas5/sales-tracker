@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sales Tracker</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>📍 Sales Tracker</h1>
+    <a href="admin">Dashboard</a>
+  </header>
+
+  <main class="narrow">
+    <!-- Step 1: pick who you are -->
+    <section id="pick" class="card" hidden>
+      <h2>Who are you?</h2>
+      <select id="employeeSelect"></select>
+      <p class="muted" id="noEmployees" hidden>No employees yet. Ask your manager to add you on the dashboard.</p>
+      <div class="right"><button class="primary" id="pickBtn">Continue</button></div>
+    </section>
+
+    <!-- Step 2: log activity -->
+    <section id="work" hidden>
+      <div class="card">
+        <div class="row" style="align-items:center">
+          <div>
+            <div class="muted">Signed in as</div>
+            <strong id="meName"></strong>
+          </div>
+          <div style="flex:none"><button class="link" id="switchBtn">Switch</button></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="gps">
+          <span class="dot" id="gpsDot"></span>
+          <div style="flex:1">
+            <div id="gpsText">Locating…</div>
+            <div class="muted" id="gpsSub"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="actions" style="margin-bottom:16px">
+        <button data-type="check_in"><span class="icon">🟢</span>Check in</button>
+        <button data-type="visit"><span class="icon">🤝</span>Log visit</button>
+        <button data-type="sale"><span class="icon">💰</span>Record sale</button>
+        <button data-type="check_out"><span class="icon">🏁</span>Check out</button>
+      </div>
+
+      <div class="card">
+        <h2>My recent activity</h2>
+        <ul class="list" id="recent"></ul>
+        <p class="muted" id="recentEmpty">Nothing logged yet.</p>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="form">
+    <form method="dialog" id="activityForm">
+      <h2 id="formTitle" style="margin-top:0;font-size:16px"></h2>
+      <div id="customerField">
+        <label for="customer">Customer / shop name</label>
+        <input id="customer" name="customer" autocomplete="off" maxlength="200">
+      </div>
+      <div id="amountField">
+        <label for="amount">Sale amount</label>
+        <input id="amount" name="amount" type="number" inputmode="decimal" min="0" step="0.01">
+      </div>
+      <label for="notes">Notes</label>
+      <textarea id="notes" name="notes" maxlength="1000" placeholder="Optional"></textarea>
+      <p class="muted">Your current GPS location will be attached.</p>
+      <div class="right">
+        <button type="button" id="cancelBtn">Cancel</button>
+        <button type="submit" class="primary" id="saveBtn">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+  (() => {
+    const $ = (id) => document.getElementById(id);
+    const LABELS = { check_in: 'Check in', visit: 'Customer visit', sale: 'Sale', check_out: 'Check out' };
+    const store = {
+      get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+      set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+      del(k) { try { localStorage.removeItem(k); } catch {} },
+    };
+    let me = null;          // { id, name }
+    let lastFix = null;     // latest GeolocationPosition
+    let currentType = null;
+
+    function toast(msg, isError) {
+      const t = document.createElement('div');
+      t.className = 'toast' + (isError ? ' error' : '');
+      t.textContent = msg;
+      document.body.appendChild(t);
+      setTimeout(() => t.remove(), 3200);
+    }
+
+    async function api(url, opts = {}) {
+      const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+      return body;
+    }
+
+    // ---------- GPS ----------
+    function showFix(pos) {
+      lastFix = pos;
+      const { latitude, longitude, accuracy } = pos.coords;
+      $('gpsDot').className = 'dot ' + (accuracy <= 100 ? 'ok' : 'warn');
+      $('gpsText').textContent = `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+      $('gpsSub').textContent = `±${Math.round(accuracy)} m · updated ${new Date(pos.timestamp).toLocaleTimeString()}`;
+    }
+    function showGpsError(err) {
+      $('gpsDot').className = 'dot err';
+      $('gpsText').textContent = 'Location unavailable';
+      $('gpsSub').textContent = err.code === 1
+        ? 'Allow location access for this site in your browser settings.'
+        : (window.isSecureContext ? err.message : 'GPS needs HTTPS (or localhost).');
+    }
+    function startWatch() {
+      if (!('geolocation' in navigator)) return showGpsError({ message: 'This browser has no GPS support.' });
+      navigator.geolocation.watchPosition(showFix, showGpsError, { enableHighAccuracy: true, maximumAge: 10000, timeout: 30000 });
+    }
+    // Get a fresh fix for a log entry; fall back to the last watched fix if it's under 2 minutes old.
+    function freshPosition() {
+      return new Promise((resolve, reject) => {
+        if (!('geolocation' in navigator)) return reject(new Error('This browser has no GPS support.'));
+        navigator.geolocation.getCurrentPosition(
+          (pos) => { showFix(pos); resolve(pos); },
+          (err) => {
+            if (lastFix && Date.now() - lastFix.timestamp < 120000) return resolve(lastFix);
+            reject(new Error(err.code === 1 ? 'Location permission denied.' : 'Could not get your GPS location.'));
+          },
+          { enableHighAccuracy: true, maximumAge: 15000, timeout: 15000 },
+        );
+      });
+    }
+
+    // ---------- Employee selection ----------
+    async function loadEmployees() {
+      const list = await api('/api/employees');
+      const sel = $('employeeSelect');
+      sel.innerHTML = '';
+      list.forEach((e) => sel.add(new Option(e.name + (e.region ? ` — ${e.region}` : ''), e.id)));
+      $('noEmployees').hidden = list.length > 0;
+      sel.hidden = $('pickBtn').disabled = list.length === 0;
+      return list;
+    }
+
+    async function init() {
+      const saved = JSON.parse(store.get('salesTracker.me') || 'null');
+      const list = await loadEmployees().catch(() => []);
+      if (saved && list.some((e) => e.id === saved.id)) return enterWork(saved);
+      $('pick').hidden = false;
+    }
+
+    function enterWork(emp) {
+      me = emp;
+      store.set('salesTracker.me', JSON.stringify(emp));
+      $('meName').textContent = emp.name;
+      $('pick').hidden = true;
+      $('work').hidden = false;
+      startWatch();
+      loadRecent();
+    }
+
+    $('pickBtn').onclick = () => {
+      const sel = $('employeeSelect');
+      if (!sel.value) return;
+      enterWork({ id: Number(sel.value), name: sel.options[sel.selectedIndex].text.split(' — ')[0] });
+    };
+    $('switchBtn').onclick = () => {
+      store.del('salesTracker.me');
+      $('work').hidden = true;
+      $('pick').hidden = false;
+      loadEmployees();
+    };
+
+    // ---------- Recent activity ----------
+    async function loadRecent() {
+      const rows = await api(`/api/employees/${me.id}/activities?limit=15`).catch(() => []);
+      const ul = $('recent');
+      ul.innerHTML = '';
+      $('recentEmpty').hidden = rows.length > 0;
+      for (const r of rows) {
+        const li = document.createElement('li');
+        const top = document.createElement('div');
+        const badge = document.createElement('span');
+        badge.className = `badge t-${r.type}`;
+        badge.textContent = LABELS[r.type];
+        top.append(badge, ' ', r.customer || '');
+        if (r.type === 'sale') top.append(` · ${Number(r.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}`);
+        const sub = document.createElement('div');
+        sub.className = 'muted';
+        const a = document.createElement('a');
+        a.href = `https://www.openstreetmap.org/?mlat=${r.lat}&mlon=${r.lng}#map=17/${r.lat}/${r.lng}`;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = `${r.lat.toFixed(4)}, ${r.lng.toFixed(4)}`;
+        sub.append(new Date(r.created_at).toLocaleString(), ' · ', a);
+        li.append(top, sub);
+        if (r.notes) {
+          const n = document.createElement('div');
+          n.className = 'muted';
+          n.textContent = r.notes;
+          li.append(n);
+        }
+        ul.append(li);
+      }
+    }
+
+    // ---------- Logging ----------
+    async function submit(type, fields = {}) {
+      const pos = await freshPosition();
+      await api('/api/activities', {
+        method: 'POST',
+        body: JSON.stringify({
+          employee_id: me.id,
+          type,
+          ...fields,
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+        }),
+      });
+      toast(`${LABELS[type]} saved with GPS ✓`);
+      loadRecent();
+    }
+
+    document.querySelectorAll('.actions button').forEach((btn) => {
+      btn.onclick = async () => {
+        const type = btn.dataset.type;
+        if (type === 'check_in' || type === 'check_out') {
+          btn.disabled = true;
+          try { await submit(type); } catch (e) { toast(e.message, true); }
+          btn.disabled = false;
+          return;
+        }
+        currentType = type;
+        $('activityForm').reset();
+        $('formTitle').textContent = LABELS[type];
+        $('amountField').hidden = type !== 'sale';
+        $('customer').required = true;
+        $('amount').required = type === 'sale';
+        $('form').showModal();
+        $('customer').focus();
+      };
+    });
+
+    $('cancelBtn').onclick = () => $('form').close();
+    $('activityForm').onsubmit = async (ev) => {
+      ev.preventDefault();
+      const save = $('saveBtn');
+      save.disabled = true;
+      save.textContent = 'Getting GPS…';
+      try {
+        await submit(currentType, {
+          customer: $('customer').value,
+          notes: $('notes').value,
+          amount: currentType === 'sale' ? $('amount').value : undefined,
+        });
+        $('form').close();
+      } catch (e) {
+        toast(e.message, true);
+      }
+      save.disabled = false;
+      save.textContent = 'Save';
+    };
+
+    init();
+  })();
+  </script>
+</body>
+</html>

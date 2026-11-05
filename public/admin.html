@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sales Dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>📊 Sales Dashboard</h1>
+    <a href="./">Field app</a>
+  </header>
+
+  <main>
+    <div class="card filters">
+      <div><label for="date">Date</label><input type="date" id="date"></div>
+      <div><label for="empFilter">Employee</label><select id="empFilter"><option value="">All employees</option></select></div>
+      <div><label for="typeFilter">Activity</label>
+        <select id="typeFilter">
+          <option value="">All activity</option>
+          <option value="check_in">Check in</option>
+          <option value="visit">Visit</option>
+          <option value="sale">Sale</option>
+          <option value="check_out">Check out</option>
+        </select>
+      </div>
+      <div style="flex:none;display:flex;gap:8px">
+        <button id="refreshBtn">Refresh</button>
+        <a class="btn" id="csvBtn" href="#">Export CSV</a>
+      </div>
+    </div>
+
+    <div class="kpis">
+      <div class="kpi"><div class="v" id="kOnDuty">–</div><div class="l">On duty now</div></div>
+      <div class="kpi"><div class="v" id="kVisits">–</div><div class="l">Customer visits</div></div>
+      <div class="kpi"><div class="v" id="kSales">–</div><div class="l">Sales closed</div></div>
+      <div class="kpi"><div class="v" id="kRevenue">–</div><div class="l">Sales value</div></div>
+      <div class="kpi"><div class="v" id="kKm">–</div><div class="l">Km travelled (straight-line)</div></div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h2>Map <span class="muted" id="mapNote"></span></h2>
+        <div id="map"></div>
+      </div>
+      <div class="card">
+        <h2>Team today</h2>
+        <div class="table-wrap">
+          <table class="compact">
+            <thead><tr><th>Employee</th><th>Status</th><th class="num">Visits</th><th class="num">Sales</th><th class="num">Km</th></tr></thead>
+            <tbody id="teamBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Activity log</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>Employee</th><th>Type</th><th>Customer</th><th class="num">Amount</th><th>Notes</th><th>Location</th></tr></thead>
+          <tbody id="actBody"></tbody>
+        </table>
+      </div>
+      <p class="muted" id="actEmpty" hidden>No activity for this filter.</p>
+    </div>
+
+    <div class="card">
+      <h2>Employees</h2>
+      <form id="addEmp" class="filters" style="margin-bottom:12px">
+        <div><label for="eName">Name</label><input id="eName" required maxlength="100"></div>
+        <div><label for="ePhone">Phone</label><input id="ePhone" maxlength="40"></div>
+        <div><label for="eRegion">Region / territory</label><input id="eRegion" maxlength="100"></div>
+        <div style="flex:none"><button class="primary" type="submit">Add employee</button></div>
+      </form>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Name</th><th>Phone</th><th>Region</th><th>Status</th><th></th></tr></thead>
+          <tbody id="empBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+  (() => {
+    const $ = (id) => document.getElementById(id);
+    const LABELS = { check_in: 'Check in', visit: 'Visit', sale: 'Sale', check_out: 'Check out' };
+    const STATUS = { on_duty: 'On duty', off_duty: 'Checked out', not_started: 'Not started' };
+    const PALETTE = ['#2563eb', '#dc2626', '#16a34a', '#9333ea', '#ea580c', '#0891b2', '#db2777', '#65a30d', '#4f46e5', '#a16207'];
+    const colorFor = (id) => PALETTE[(id - 1) % PALETTE.length];
+    const money = (n) => Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const tz = new Date().getTimezoneOffset();
+
+    function toast(msg, isError) {
+      const t = document.createElement('div');
+      t.className = 'toast' + (isError ? ' error' : '');
+      t.textContent = msg;
+      document.body.appendChild(t);
+      setTimeout(() => t.remove(), 3200);
+    }
+    async function api(url, opts = {}) {
+      const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+      return body;
+    }
+
+    // Local date as YYYY-MM-DD
+    const today = () => {
+      const d = new Date();
+      return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+    };
+    $('date').value = today();
+
+    // ---------- Map ----------
+    const map = L.map('map').setView([20, 0], 2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors',
+    }).addTo(map);
+    const layer = L.layerGroup().addTo(map);
+
+    function drawMap(rows) {
+      layer.clearLayers();
+      const byEmp = new Map();
+      // rows are newest-first; draw routes oldest-first
+      [...rows].reverse().forEach((r) => {
+        if (!byEmp.has(r.employee_id)) byEmp.set(r.employee_id, []);
+        byEmp.get(r.employee_id).push(r);
+      });
+      const bounds = [];
+      for (const [empId, acts] of byEmp) {
+        const color = colorFor(empId);
+        const pts = acts.map((a) => [a.lat, a.lng]);
+        if (pts.length > 1) L.polyline(pts, { color, weight: 3, opacity: 0.6, dashArray: '6 6' }).addTo(layer);
+        acts.forEach((a, i) => {
+          const isLast = i === acts.length - 1;
+          L.circleMarker([a.lat, a.lng], {
+            radius: isLast ? 9 : a.type === 'sale' ? 7 : 5,
+            color, weight: isLast ? 3 : 1.5, fillColor: color, fillOpacity: a.type === 'sale' || isLast ? 0.9 : 0.35,
+          })
+            .bindPopup(
+              `<strong>${esc(a.employee_name)}</strong><br>${esc(LABELS[a.type])}${a.customer ? ' · ' + esc(a.customer) : ''}` +
+              `${a.type === 'sale' ? '<br>Amount: ' + money(a.amount) : ''}` +
+              `${a.notes ? '<br><em>' + esc(a.notes) + '</em>' : ''}` +
+              `<br><small>${new Date(a.created_at).toLocaleString()}${a.accuracy ? ' · ±' + Math.round(a.accuracy) + ' m' : ''}</small>` +
+              `${isLast ? '<br><small><b>Last known position</b></small>' : ''}`,
+            )
+            .addTo(layer);
+          bounds.push([a.lat, a.lng]);
+        });
+      }
+      $('mapNote').textContent = rows.length ? `· ${rows.length} GPS points` : '· no points';
+      if (bounds.length) map.fitBounds(bounds, { padding: [30, 30], maxZoom: 16 });
+    }
+
+    // ---------- Data ----------
+    function params() {
+      const p = new URLSearchParams({ date: $('date').value, tz });
+      if ($('empFilter').value) p.set('employee_id', $('empFilter').value);
+      if ($('typeFilter').value) p.set('type', $('typeFilter').value);
+      return p;
+    }
+
+    async function loadEmployees() {
+      const list = await api('/api/employees?all=1');
+      const sel = $('empFilter');
+      const current = sel.value;
+      sel.length = 1;
+      list.forEach((e) => sel.add(new Option(e.name + (e.active ? '' : ' (inactive)'), e.id)));
+      sel.value = current;
+
+      $('empBody').innerHTML = list.map((e) => `
+        <tr>
+          <td><span class="swatch" style="background:${colorFor(e.id)}"></span>${esc(e.name)}</td>
+          <td>${esc(e.phone || '')}</td>
+          <td>${esc(e.region || '')}</td>
+          <td>${e.active ? 'Active' : '<span class="muted">Inactive</span>'}</td>
+          <td><button class="link" data-toggle="${e.id}" data-active="${e.active}">${e.active ? 'Deactivate' : 'Reactivate'}</button></td>
+        </tr>`).join('') || '<tr><td colspan="5" class="muted">No employees yet — add your first one above.</td></tr>';
+    }
+
+    async function loadSummary() {
+      const { employees } = await api(`/api/summary?date=${$('date').value}&tz=${tz}`);
+      const sum = (k) => employees.reduce((s, e) => s + e[k], 0);
+      $('kOnDuty').textContent = `${employees.filter((e) => e.status === 'on_duty').length} / ${employees.length}`;
+      $('kVisits').textContent = sum('visits');
+      $('kSales').textContent = sum('sales_count');
+      $('kRevenue').textContent = money(sum('sales_total'));
+      $('kKm').textContent = sum('distance_km').toFixed(1);
+      $('teamBody').innerHTML = employees.map((e) => `
+        <tr>
+          <td><span class="swatch" style="background:${colorFor(e.employee_id)}"></span>${esc(e.name)}
+            ${e.last ? `<div class="muted">Last seen ${new Date(e.last.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>` : ''}</td>
+          <td><span class="badge s-${e.status}">${STATUS[e.status]}</span></td>
+          <td class="num">${e.visits}</td>
+          <td class="num">${money(e.sales_total)}</td>
+          <td class="num">${e.distance_km.toFixed(1)}</td>
+        </tr>`).join('') || '<tr><td colspan="5" class="muted">No active employees.</td></tr>';
+    }
+
+    async function loadActivities() {
+      const rows = await api('/api/activities?' + params());
+      $('actEmpty').hidden = rows.length > 0;
+      $('actBody').innerHTML = rows.map((r) => `
+        <tr>
+          <td>${new Date(r.created_at).toLocaleTimeString()}</td>
+          <td><span class="swatch" style="background:${colorFor(r.employee_id)}"></span>${esc(r.employee_name)}</td>
+          <td><span class="badge t-${r.type}">${LABELS[r.type]}</span></td>
+          <td>${esc(r.customer || '')}</td>
+          <td class="num">${r.type === 'sale' ? money(r.amount) : ''}</td>
+          <td class="wrap">${esc(r.notes || '')}</td>
+          <td><button class="link" data-lat="${r.lat}" data-lng="${r.lng}">${r.lat.toFixed(4)}, ${r.lng.toFixed(4)}</button></td>
+        </tr>`).join('');
+      drawMap(rows);
+    }
+
+    async function refresh() {
+      $('csvBtn').href = '/api/export.csv?' + params();
+      try {
+        await Promise.all([loadSummary(), loadActivities()]);
+      } catch (e) {
+        toast(e.message, true);
+      }
+    }
+
+    // ---------- Events ----------
+    ['date', 'empFilter', 'typeFilter'].forEach((id) => $(id).addEventListener('change', refresh));
+    $('refreshBtn').onclick = refresh;
+
+    $('actBody').addEventListener('click', (ev) => {
+      const b = ev.target.closest('button[data-lat]');
+      if (!b) return;
+      map.setView([Number(b.dataset.lat), Number(b.dataset.lng)], 17);
+      $('map').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+
+    $('empBody').addEventListener('click', async (ev) => {
+      const b = ev.target.closest('button[data-toggle]');
+      if (!b) return;
+      try {
+        await api(`/api/employees/${b.dataset.toggle}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ active: b.dataset.active !== '1' }),
+        });
+        await loadEmployees();
+        refresh();
+      } catch (e) { toast(e.message, true); }
+    });
+
+    $('addEmp').onsubmit = async (ev) => {
+      ev.preventDefault();
+      try {
+        await api('/api/employees', {
+          method: 'POST',
+          body: JSON.stringify({ name: $('eName').value, phone: $('ePhone').value, region: $('eRegion').value }),
+        });
+        ev.target.reset();
+        toast('Employee added');
+        await loadEmployees();
+        refresh();
+      } catch (e) { toast(e.message, true); }
+    };
+
+    loadEmployees().catch((e) => toast(e.message, true));
+    refresh();
+    // Auto-refresh every minute so the dashboard stays live while it's open on today's date.
+    setInterval(() => { if ($('date').value === today() && !document.hidden) refresh(); }, 60000);
+  })();
+  </script>
+</body>
+</html>

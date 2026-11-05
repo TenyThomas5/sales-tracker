@@ -1,0 +1,18 @@
+{
+  "name": "sales-tracker",
+  "version": "1.0.0",
+  "description": "Simple sales employee tracking app with GPS-tagged check-ins, visits and sales",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "seed": "node scripts/seed.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.22.3"
+  }
+}
